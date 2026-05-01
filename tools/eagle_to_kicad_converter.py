@@ -7,13 +7,35 @@ used as a learning tool in addition to being an importer.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from datetime import datetime, timezone
 import html
+import json
 import math
 import re
+import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from eaglelib2kicad.services.eagle_library_context_service import (
+    EagleLibraryContextService,
+)
+from eaglelib2kicad.services.kicad_environment_service import KiCadEnvironmentService
+from eaglelib2kicad.services.kicad_library_context_service import (
+    KiCadLibraryContextService,
+)
+from eaglelib2kicad.services.library_migration_analysis_service import (
+    LibraryMigrationAnalysisService,
+    MigrationAnalysisRow,
+)
 
 
 DEFAULT_EAGLE_LAYER_MAP: dict[int, str] = {
@@ -161,6 +183,126 @@ class KiCadFootprintItem:
 
     name: str
     file_path: Path
+
+@dataclass(frozen=True)
+class MigrationAnalysisArtifact:
+    """Structured analysis artifact emitted for review queue workflows."""
+
+    generated_at_utc: str
+    eagle_library: str
+    kicad_config_home: str
+    kicad_project_directory: str | None
+    total_devices: int
+    queue_counts: dict[str, int]
+    confidence_counts: dict[str, int]
+    pathway_counts: dict[str, int]
+    rows: tuple[MigrationAnalysisRow, ...]
+
+    def to_json_dict(self) -> dict[str, object]:
+        """Serialize artifact to a JSON-compatible dictionary."""
+        return {
+            "generated_at_utc": self.generated_at_utc,
+            "eagle_library": self.eagle_library,
+            "kicad_config_home": self.kicad_config_home,
+            "kicad_project_directory": self.kicad_project_directory,
+            "total_devices": self.total_devices,
+            "queue_counts": self.queue_counts,
+            "confidence_counts": self.confidence_counts,
+            "pathway_counts": self.pathway_counts,
+            "rows": [
+                {
+                    "device_key": row.device_key,
+                    "pathway": row.pathway,
+                    "symbol_name": row.symbol_name,
+                    "package_name": row.package_name,
+                    "confidence": row.confidence,
+                    "review_queue": row.review_queue,
+                    "review_required": row.review_required,
+                    "reasons": list(row.reasons),
+                    "symbol_library": row.symbol_library,
+                    "footprint_library": row.footprint_library,
+                    "eagle_pin_count": row.eagle_pin_count,
+                    "symbol_pin_count": row.symbol_pin_count,
+                    "footprint_pad_count": row.footprint_pad_count,
+                }
+                for row in self.rows
+            ],
+        }
+
+
+def build_migration_analysis_artifact(
+    *,
+    eagle_library: Path,
+    kicad_config_home: Path,
+    kicad_project_directory: Path | None,
+    rows: Sequence[MigrationAnalysisRow],
+) -> MigrationAnalysisArtifact:
+    """Build structured analysis artifact from migration analysis rows."""
+    queue_counter = Counter(row.review_queue for row in rows)
+    confidence_counter = Counter(row.confidence for row in rows)
+    pathway_counter = Counter(row.pathway for row in rows)
+    queue_counts = {
+        "none": queue_counter.get("none", 0),
+        "standard": queue_counter.get("standard", 0),
+        "priority": queue_counter.get("priority", 0),
+    }
+    return MigrationAnalysisArtifact(
+        generated_at_utc=datetime.now(timezone.utc).isoformat(),
+        eagle_library=str(eagle_library.resolve()),
+        kicad_config_home=str(kicad_config_home.resolve()),
+        kicad_project_directory=(
+            str(kicad_project_directory.resolve())
+            if kicad_project_directory is not None
+            else None
+        ),
+        total_devices=len(rows),
+        queue_counts=queue_counts,
+        confidence_counts={
+            "high": confidence_counter.get("high", 0),
+            "medium": confidence_counter.get("medium", 0),
+            "low": confidence_counter.get("low", 0),
+        },
+        pathway_counts={
+            "commodity_passive": pathway_counter.get("commodity_passive", 0),
+            "ic_regulator_specialty": pathway_counter.get("ic_regulator_specialty", 0),
+            "connector_switch_mechanical": pathway_counter.get(
+                "connector_switch_mechanical", 0
+            ),
+            "schematic_annotation": pathway_counter.get("schematic_annotation", 0),
+            "uncategorized": pathway_counter.get("uncategorized", 0),
+        },
+        rows=tuple(rows),
+    )
+
+
+def run_migration_analysis(
+    *,
+    eagle_library: Path,
+    kicad_project_directory: Path | None = None,
+    kicad_config_home: Path | None = None,
+) -> MigrationAnalysisArtifact:
+    """Run importer-side migration analysis and return report artifact."""
+    eagle_context_service = EagleLibraryContextService()
+    environment_service = KiCadEnvironmentService()
+    kicad_context_service = KiCadLibraryContextService()
+    migration_service = LibraryMigrationAnalysisService()
+
+    eagle_devices = eagle_context_service.load_device_contexts(eagle_library)
+    environment_snapshot = environment_service.discover_configured_libraries(
+        project_directory=kicad_project_directory,
+        config_home=kicad_config_home,
+    )
+    kicad_context = kicad_context_service.load_contexts(environment=environment_snapshot)
+    rows = migration_service.analyze(
+        eagle_devices=eagle_devices,
+        kicad_context=kicad_context,
+    )
+    return build_migration_analysis_artifact(
+        eagle_library=eagle_library,
+        kicad_config_home=environment_snapshot.config_home,
+        kicad_project_directory=kicad_project_directory,
+        rows=rows,
+    )
 
 
 @dataclass
@@ -1752,6 +1894,32 @@ def build_cli_parser() -> argparse.ArgumentParser:
             "Example: --layer-map 21:F.SilkS,F.Fab ; use an empty right side to disable a layer."
         ),
     )
+    parser.add_argument(
+        "--analyze-migration",
+        action="store_true",
+        help="Generate migration analysis report artifact for the Eagle library.",
+    )
+    parser.add_argument(
+        "--analysis-output",
+        type=Path,
+        default=None,
+        help=(
+            "Output path for migration analysis JSON artifact. "
+            "Default: <kicad-pretty>/<eagle-lib-stem>.migration-analysis.json"
+        ),
+    )
+    parser.add_argument(
+        "--kicad-project-dir",
+        type=Path,
+        default=None,
+        help="Optional KiCad project directory for project-scope library table discovery.",
+    )
+    parser.add_argument(
+        "--kicad-config-home",
+        type=Path,
+        default=None,
+        help="Optional KiCad config directory containing global sym-lib-table/fp-lib-table.",
+    )
     return parser
 
 def parse_layer_map_overrides(entries: Sequence[str]) -> LayerMapNormalized:
@@ -1788,29 +1956,56 @@ def run_cli(args: argparse.Namespace) -> int:
         return 0
 
     selected_packages = list(dict.fromkeys(args.package))
-    if not selected_packages:
-        print("No packages requested. Use --package PACKAGE_NAME (repeatable) or --list.")
+    if not selected_packages and not args.analyze_migration:
+        print(
+            "No packages requested. Use --package PACKAGE_NAME (repeatable), "
+            "--list, or --analyze-migration."
+        )
         return 1
 
-    results = convert_packages(
-        library=library,
-        package_names=selected_packages,
-        destination_pretty=args.kicad_pretty,
-        overwrite=args.overwrite,
-        include_dimensions=args.include_dimensions,
-        layer_map=layer_map_overrides or None,
-    )
+    if selected_packages:
+        results = convert_packages(
+            library=library,
+            package_names=selected_packages,
+            destination_pretty=args.kicad_pretty,
+            overwrite=args.overwrite,
+            include_dimensions=args.include_dimensions,
+            layer_map=layer_map_overrides or None,
+        )
+        created_count = 0
+        for result in results:
+            status = "CREATED" if result.created else "SKIPPED"
+            print(f"[{status}] {result.eagle_name} -> {result.output_path.name}")
+            if result.created:
+                created_count += 1
+            for warning in result.warnings:
+                print(f"  - {warning}")
+        print(f"\nConverted {created_count}/{len(results)} package(s).")
 
-    created_count = 0
-    for result in results:
-        status = "CREATED" if result.created else "SKIPPED"
-        print(f"[{status}] {result.eagle_name} -> {result.output_path.name}")
-        if result.created:
-            created_count += 1
-        for warning in result.warnings:
-            print(f"  - {warning}")
-
-    print(f"\nConverted {created_count}/{len(results)} package(s).")
+    if args.analyze_migration:
+        artifact = run_migration_analysis(
+            eagle_library=args.eagle_lib,
+            kicad_project_directory=args.kicad_project_dir,
+            kicad_config_home=args.kicad_config_home,
+        )
+        output_path = (
+            args.analysis_output
+            if args.analysis_output is not None
+            else args.kicad_pretty / f"{args.eagle_lib.stem}.migration-analysis.json"
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(artifact.to_json_dict(), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print("\nMigration analysis report:")
+        print(
+            "  queue counts: "
+            f"none={artifact.queue_counts['none']} "
+            f"standard={artifact.queue_counts['standard']} "
+            f"priority={artifact.queue_counts['priority']}"
+        )
+        print(f"  artifact: {output_path}")
     return 0
 
 
