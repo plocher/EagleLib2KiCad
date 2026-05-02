@@ -21,6 +21,7 @@ class SymbolContext:
     symbol_name: str
     lib_id: str
     footprint_ref: str
+    pin_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class FootprintLibraryItem:
     library_nickname: str
     footprint_name: str
     source_path: Path
+    pad_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,7 @@ class KiCadLibraryContextService:
                         symbol_name=symbol_name,
                         lib_id=lib_id,
                         footprint_ref=properties.get("Footprint", "").strip(),
+                        pin_count=self._count_symbol_pin_nodes(node),
                     )
                 )
         return contexts
@@ -136,6 +139,7 @@ class KiCadLibraryContextService:
                         library_nickname=library.nickname,
                         footprint_name=footprint_file.stem,
                         source_path=footprint_file,
+                        pad_count=self._count_footprint_pads(footprint_file),
                     )
                 )
         return items
@@ -235,4 +239,37 @@ class KiCadLibraryContextService:
             if isinstance(key, str):
                 properties[key] = str(value)
         return properties
+
+    def _count_symbol_pin_nodes(self, node: list[object]) -> int:
+        """Count `(pin ...)` nodes in a symbol tree recursively."""
+        count = 0
+        for child in node[2:]:
+            if not isinstance(child, list) or not child:
+                continue
+            if str(child[0]) == "pin":
+                count += 1
+                continue
+            count += self._count_symbol_pin_nodes(child)
+        return count
+
+    def _count_footprint_pads(self, footprint_file: Path) -> int:
+        """Count `(pad ...)` nodes in a KiCad footprint file."""
+        try:
+            text = footprint_file.read_text(encoding="utf-8")
+        except OSError:
+            return 0
+        try:
+            root = parse_sexp(text)
+        except SexpParseError:
+            return 0
+        if not root:
+            return 0
+
+        count = 0
+        for item in root[1:]:
+            if not isinstance(item, list) or not item:
+                continue
+            if str(item[0]) == "pad":
+                count += 1
+        return count
 
